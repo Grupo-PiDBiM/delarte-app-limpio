@@ -1,10 +1,34 @@
+# =========================
+# PARTE 1 — BASE + PERSISTENCIA + DESPIECE COMPLETO
+# =========================
 import streamlit as st
 import pandas as pd
 import numpy as np
 import math
+import os
 from io import BytesIO
 
-ARCHIVO_STOCK = "stock.csv"
+# --- PERSISTENCIA DEL STOCK ---
+# Semilla del repo (no se pisa)
+DEFAULT_STOCK = "stock.csv"
+# Archivo persistente real (no se reinicia entre sesiones)
+RUNTIME_STOCK = os.path.join(os.path.expanduser("~"), ".delarte_stock.csv")
+
+# En el resto del código usaremos ARCHIVO_STOCK (apunta al persistente)
+ARCHIVO_STOCK = RUNTIME_STOCK
+
+# Si no existe el persistente, lo inicializamos copiando desde la semilla del repo (solo la primera vez)
+def _ensure_persistent_stock_initialized():
+    if not os.path.exists(ARCHIVO_STOCK):
+        try:
+            seed_df = pd.read_csv(DEFAULT_STOCK)
+            seed_df.to_csv(ARCHIVO_STOCK, index=False)
+        except Exception:
+            # Si no existe la semilla o hubo un problema, creamos un CSV vacío compatible
+            cols = ["Categoría", "Tipo", "Unidad", "Stock"]
+            pd.DataFrame(columns=cols).to_csv(ARCHIVO_STOCK, index=False)
+
+_ensure_persistent_stock_initialized()
 
 # --- Funciones de stock ---
 def cargar_stock():
@@ -36,7 +60,7 @@ TELA_ANCHO_BASE_CM = 50
 TELA_AREA_BASE_CM2 = TELA_LARGO_BASE_CM * TELA_ANCHO_BASE_CM  # 7000
 TELA_TIPO_BASE_PREFERIDO = "Rollo 140x50"  # fallback genérico si no encuentra 'asiento'/'respaldo'
 
-# Ancho específico por modelo y tipo (según lo que pasaste)
+# Ancho específico por modelo y tipo
 ANCHO_TELA_CM = {
     ("Silla Franca", "Tela asiento"): 46,
     # Franca sin respaldo
@@ -180,7 +204,9 @@ df_despiece = pd.DataFrame([
     ["Perchero", "Caño", '3/4"', 50, 1],
     ["Perchero", "Caño", '1 1/4"', 130, 1],
 ], columns=["Modelo", "Categoría", "Tipo", "Largo (cm)", "Cantidad"])
-
+# =========================
+# PARTE 2 — UI + SIMULACIÓN + GUARDADO PERSISTENTE
+# =========================
 st.set_page_config(page_title="Sistema de Despiece", layout="wide")
 st.title("📐 Sistema de Despiece y Stock – DELARTE")
 
@@ -231,7 +257,6 @@ if menu == "📐 Despiece":
         return np.nan
 
     df_modelo["Ancho (cm)"] = df_modelo.apply(ancho_visible_row, axis=1)
-    # Asegurar dtype numérico (evitar mezcla object)
     df_modelo["Ancho (cm)"] = pd.to_numeric(df_modelo["Ancho (cm)"], errors="coerce")
 
     # Stock actual por fila
@@ -309,7 +334,7 @@ if menu == "📐 Despiece":
     df_vista = df_modelo[columnas_vista].copy()
     st.dataframe(df_vista, use_container_width=True)
 
-    # --- Guardado de stock (solo si OK) ---
+    # --- Guardado de stock (PERSISTENTE) ---
     if st.button("💾 Guardar Producción y Actualizar Stock", key="guardar_produccion"):
         for clave, consumo in consumo_real.items():
             if clave[0] == "Caño":
@@ -322,18 +347,19 @@ if menu == "📐 Despiece":
                 if mask.any():
                     df_stock.loc[mask, "Stock"] -= float(consumo)
 
-        guardar_stock(df_stock)
-        st.success("✅ Producción guardada y stock actualizado.")
+        guardar_stock(df_stock)  # <-- queda guardado en ~/.delarte_stock.csv
+        st.success("✅ Producción guardada y stock actualizado (persistente).")
 
 elif menu == "📦 Stock":
     st.subheader("📦 Stock de Materiales")
     df_stock = cargar_stock()
     edited_df = st.data_editor(df_stock, num_rows="dynamic", use_container_width=True)
     if st.button("💾 Guardar Cambios en Stock", key="guardar_stock"):
-        guardar_stock(edited_df)
-        st.success("✅ Cambios guardados correctamente.")
-
-# --- EXPORTACIÓN A EXCEL ---
+        guardar_stock(edited_df)  # <-- queda guardado en ~/.delarte_stock.csv
+        st.success("✅ Cambios guardados correctamente (persistente).")
+# =========================
+# PARTE 3 — EXPORTACIÓN A EXCEL + DESCARGA
+# =========================
 def exportar_excel(df, modelo, cantidad, cliente, color_tela, color_cano):
     import openpyxl
     from openpyxl.utils.dataframe import dataframe_to_rows
@@ -345,7 +371,7 @@ def exportar_excel(df, modelo, cantidad, cliente, color_tela, color_cano):
     ws = wb.active
     ws.title = "Despiece"
 
-    # Configuración de impresión
+    # Configuración de impresión (A4 horizontal, 1 página)
     ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.sheet_properties.pageSetUpPr.fitToPage = True
@@ -390,12 +416,18 @@ def exportar_excel(df, modelo, cantidad, cliente, color_tela, color_cano):
     return output.getvalue()
 
 # --- BOTÓN PARA IMPRIMIR DESPIECE ---
-if menu == "📐 Despiece" and not df_modelo.empty:
-    excel_bytes = exportar_excel(df_modelo, modelo_seleccionado, cantidad, cliente, color_tela, color_cano)
-    st.download_button(
-        label="🖨️ Imprimir Despiece",
-        data=excel_bytes,
-        file_name=f"Despiece_{modelo_seleccionado}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="descargar_excel"
-    )
+# (Solo se muestra en la pestaña de Despiece)
+# Nota: df_modelo existe si estás en el menú "📐 Despiece"
+try:
+    if menu == "📐 Despiece" and not df_modelo.empty:
+        excel_bytes = exportar_excel(df_modelo, modelo_seleccionado, cantidad, cliente, color_tela, color_cano)
+        st.download_button(
+            label="🖨️ Imprimir Despiece",
+            data=excel_bytes,
+            file_name=f"Despiece_{modelo_seleccionado}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="descargar_excel"
+        )
+except NameError:
+    # No estás en el menú de despiece (df_modelo no existe), no mostramos botón
+    pass
