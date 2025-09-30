@@ -8,25 +8,26 @@ import math
 import os
 from io import BytesIO
 
-# --- PERSISTENCIA DEL STOCK ---
-# Semilla del repo (no se pisa)
+# -------- PERSISTENCIA DE STOCK (ROBUSTA) --------
+# Semilla del repo (no se pisa): este es tu archivo original del proyecto
 DEFAULT_STOCK = "stock.csv"
-# Archivo persistente real (no se reinicia entre sesiones)
-RUNTIME_STOCK = os.path.join(os.path.expanduser("~"), ".delarte_stock.csv")
 
-# En el resto del código usaremos ARCHIVO_STOCK (apunta al persistente)
+# Archivo persistente real: vive en la carpeta del proyecto (junto al app)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_STOCK = os.path.join(APP_DIR, "stock_runtime.csv")
+
+# Usaremos siempre ARCHIVO_STOCK para leer/escribir el stock actual
 ARCHIVO_STOCK = RUNTIME_STOCK
 
-# Si no existe el persistente, lo inicializamos copiando desde la semilla del repo (solo la primera vez)
 def _ensure_persistent_stock_initialized():
+    """Si no existe el persistente, se crea copiando desde la semilla DEFAULT_STOCK (solo la 1ª vez)."""
     if not os.path.exists(ARCHIVO_STOCK):
         try:
             seed_df = pd.read_csv(DEFAULT_STOCK)
-            seed_df.to_csv(ARCHIVO_STOCK, index=False)
         except Exception:
             # Si no existe la semilla o hubo un problema, creamos un CSV vacío compatible
-            cols = ["Categoría", "Tipo", "Unidad", "Stock"]
-            pd.DataFrame(columns=cols).to_csv(ARCHIVO_STOCK, index=False)
+            seed_df = pd.DataFrame(columns=["Categoría", "Tipo", "Unidad", "Stock"])
+        seed_df.to_csv(ARCHIVO_STOCK, index=False)
 
 _ensure_persistent_stock_initialized()
 
@@ -210,6 +211,8 @@ df_despiece = pd.DataFrame([
 st.set_page_config(page_title="Sistema de Despiece", layout="wide")
 st.title("📐 Sistema de Despiece y Stock – DELARTE")
 
+st.caption(f"📁 Stock persistente: {ARCHIVO_STOCK}")
+
 menu = st.sidebar.radio("Menú", ["📐 Despiece", "📦 Stock"])
 
 if menu == "📐 Despiece":
@@ -283,7 +286,7 @@ if menu == "📐 Despiece":
         elif row["Categoría"] == "Goma espuma":
             consumo_real[clave] = consumo_real.get(clave, 0.0) + float(row["Total"] * fraccion_goma)
         elif row["Categoría"] == "Tela":
-            # área = largo x ancho (si no hay ancho visible, fallback al diccionario)
+            # área = largo x ancho
             ancho_val = row["Ancho (cm)"]
             if pd.isna(ancho_val):
                 ancho_val = float(ANCHO_TELA_CM.get((row["Modelo"], row["Tipo"]), 0.0))
@@ -347,7 +350,7 @@ if menu == "📐 Despiece":
                 if mask.any():
                     df_stock.loc[mask, "Stock"] -= float(consumo)
 
-        guardar_stock(df_stock)  # <-- queda guardado en ~/.delarte_stock.csv
+        guardar_stock(df_stock)  # <-- queda guardado en stock_runtime.csv
         st.success("✅ Producción guardada y stock actualizado (persistente).")
 
 elif menu == "📦 Stock":
@@ -355,7 +358,7 @@ elif menu == "📦 Stock":
     df_stock = cargar_stock()
     edited_df = st.data_editor(df_stock, num_rows="dynamic", use_container_width=True)
     if st.button("💾 Guardar Cambios en Stock", key="guardar_stock"):
-        guardar_stock(edited_df)  # <-- queda guardado en ~/.delarte_stock.csv
+        guardar_stock(edited_df)  # <-- queda guardado en stock_runtime.csv
         st.success("✅ Cambios guardados correctamente (persistente).")
 # =========================
 # PARTE 3 — EXPORTACIÓN A EXCEL + DESCARGA
@@ -399,7 +402,6 @@ def exportar_excel(df, modelo, cantidad, cliente, color_tela, color_cano):
     start_row = len(encabezado) + 2
     for r_idx, row in enumerate(dataframe_to_rows(datos, index=False, header=True), start=start_row):
         for c_idx, value in enumerate(row, start=1):
-            # Reemplazar NaN por string vacío al escribir
             val = "" if (value is None or (isinstance(value, float) and math.isnan(value))) else value
             cell = ws.cell(row=r_idx, column=c_idx, value=val)
             cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -416,8 +418,6 @@ def exportar_excel(df, modelo, cantidad, cliente, color_tela, color_cano):
     return output.getvalue()
 
 # --- BOTÓN PARA IMPRIMIR DESPIECE ---
-# (Solo se muestra en la pestaña de Despiece)
-# Nota: df_modelo existe si estás en el menú "📐 Despiece"
 try:
     if menu == "📐 Despiece" and not df_modelo.empty:
         excel_bytes = exportar_excel(df_modelo, modelo_seleccionado, cantidad, cliente, color_tela, color_cano)
@@ -429,5 +429,4 @@ try:
             key="descargar_excel"
         )
 except NameError:
-    # No estás en el menú de despiece (df_modelo no existe), no mostramos botón
     pass
