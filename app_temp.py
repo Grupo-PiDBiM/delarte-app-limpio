@@ -8,40 +8,144 @@ import math
 import os
 from io import BytesIO
 
-# -------- PERSISTENCIA DE STOCK (ROBUSTA) --------
-# Semilla del repo (no se pisa): este es tu archivo original del proyecto
-DEFAULT_STOCK = "stock.csv"
-
-# Archivo persistente real: vive en la carpeta del proyecto (junto al app)
+# -------- PERSISTENCIA DE STOCK --------
+DEFAULT_STOCK = "stock.csv"  # semilla del repo (no se pisa)
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-RUNTIME_STOCK = os.path.join(APP_DIR, "stock_runtime.csv")
+RUNTIME_STOCK = os.path.join(APP_DIR, "stock_runtime.csv")  # archivo persistente local
+ARCHIVO_STOCK = RUNTIME_STOCK  # se usa siempre este handler
 
-# Usaremos siempre ARCHIVO_STOCK para leer/escribir el stock actual
-ARCHIVO_STOCK = RUNTIME_STOCK
+# -------- Google Sheets (opcional, recomendado) --------
+GSHEET_TAB = "Stock"  # nombre de pestaña dentro del doc
+_GS_ENABLED = False
+_STOCK_SHEET_ID = None
+try:
+    # Activamos GS solo si existen ambos secrets
+    if hasattr(st, "secrets") and ("gcp_service_account" in st.secrets) and ("STOCK_SHEET_ID" in st.secrets):
+        from google.oauth2 import service_account
+        import gspread
 
-def _ensure_persistent_stock_initialized():
-    """Si no existe el persistente, se crea copiando desde la semilla DEFAULT_STOCK (solo la 1ª vez)."""
-    if not os.path.exists(ARCHIVO_STOCK):
+        _GCP_CREDS = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        _STOCK_SHEET_ID = st.secrets["STOCK_SHEET_ID"]
+        _GS_ENABLED = True
+except Exception:
+    _GS_ENABLED = False  # si falla algo, quedamos en modo local sin mostrar nada
+
+def _ensure_local_seed():
+    """Inicializa el CSV local persistente desde DEFAULT_STOCK si no existe."""
+    if not os.path.exists(RUNTIME_STOCK):
         try:
             seed_df = pd.read_csv(DEFAULT_STOCK)
         except Exception:
-            # Si no existe la semilla o hubo un problema, creamos un CSV vacío compatible
             seed_df = pd.DataFrame(columns=["Categoría", "Tipo", "Unidad", "Stock"])
-        seed_df.to_csv(ARCHIVO_STOCK, index=False)
+        seed_df.to_csv(RUNTIME_STOCK, index=False)
 
-_ensure_persistent_stock_initialized()
+def _ensure_gsheet_seed():
+    """Inicializa la pestaña 'Stock' si está vacía o no existe, copiando desde DEFAULT_STOCK."""
+    try:
+        gc = gspread.authorize(_GCP_CREDS)
+        sh = gc.open_by_key(_STOCK_SHEET_ID)
+        try:
+            ws = sh.worksheet(GSHEET_TAB)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=GSHEET_TAB, rows=1000, cols=10)
 
-# --- Funciones de stock ---
-def cargar_stock():
-    df = pd.read_csv(ARCHIVO_STOCK)
-    # Normalizar espacios en columnas de texto
+        values = ws.get_all_values()
+        if not values:
+            try:
+                seed_df = pd.read_csv(DEFAULT_STOCK)
+            except Exception:
+                seed_df = pd.DataFrame(columns=["Categoría", "Tipo", "Unidad", "Stock"])
+            ws.clear()
+            ws.update([seed_df.columns.tolist()] + seed_df.values.tolist())
+        else:
+            header = values[0]
+            expected = ["Categoría", "Tipo", "Unidad", "Stock"]
+            if header != expected:
+                df = pd.DataFrame(values[1:], columns=header)
+                df.columns = [c.strip() for c in df.columns]
+                for col in expected:
+                    if col not in df.columns:
+                        df[col] = "" if col != "Stock" else 0
+                df = df[expected]
+                ws.clear()
+                ws.update([expected] + df.values.tolist())
+    except Exception:
+        pass  # si falla Sheets, se usa local
+
+# Inicialización de la semilla según el modo
+if _GS_ENABLED:
+    _ensure_gsheet_seed()
+else:
+    _ensure_local_seed()
+
+# ======= LECTURA/ESCRITURA PERSISTENTE =======
+def _gs_read_stock() -> pd.DataFrame:
+    gc = gspread.authorize(_GCP_CREDS)
+    sh = gc.open_by_key(_STOCK_SHEET_ID)
+    ws = sh.worksheet(GSHEET_TAB)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame(columns=["Categoría", "Tipo", "Unidad", "Stock"])
+    header = values[0]
+    data = values[1:]
+    df = pd.DataFrame(data, columns=header)
+    if "Stock" in df.columns:
+        df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0.0)
     for col in ["Categoría", "Tipo", "Unidad"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
     return df
 
-def guardar_stock(df):
-    df.to_csv(ARCHIVO_STOCK, index=False)
+def _gs_write_stock(df: pd.DataFrame):
+    gc = gspread.authorize(_GCP_CREDS)
+    sh = gc.open_by_key(_STOCK_SHEET_ID)
+    try:
+        ws = sh.worksheet(GSHEET_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=GSHEET_TAB, rows=1000, cols=10)
+    df2 = df.copy()
+    for col in ["Categoría", "Tipo", "Unidad"]:
+        if col in df2.columns:
+            df2[col] = df2[col].astype(str).str.strip()
+    if "Stock" in df2.columns:
+        df2["Stock"] = pd.to_numeric(df2["Stock"], errors="coerce").fillna(0.0)
+    ws.clear()
+    ws.update([df2.columns.tolist()] + df2.values.tolist())
+
+def cargar_stock():
+    if _GS_ENABLED:
+        try:
+            return _gs_read_stock()
+        except Exception:
+            pass  # si falla, caemos a local silenciosamente
+    # Local fallback
+    df = pd.read_csv(RUNTIME_STOCK)
+    for col in ["Categoría", "Tipo", "Unidad"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    if "Stock" in df.columns:
+        df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0.0)
+    return df
+
+def guardar_stock(df: pd.DataFrame):
+    # Intentar Sheets si está habilitado
+    if _GS_ENABLED:
+        try:
+            _gs_write_stock(df)
+            return
+        except Exception:
+            pass
+    # Local fallback
+    df2 = df.copy()
+    if "Stock" in df2.columns:
+        df2["Stock"] = pd.to_numeric(df2["Stock"], errors="coerce").fillna(0.0)
+    df2.to_csv(RUNTIME_STOCK, index=False)
 
 # --- Fracción de goma espuma por modelo ---
 def calcular_fraccion_goma_espuma(modelo):
@@ -55,40 +159,26 @@ def calcular_fraccion_goma_espuma(modelo):
     }
     return fracciones.get(modelo, 0)
 
-# --- Tela por ÁREA (rollo base 140 x 50 cm) ---
+# --- Tela por área (rollo base 140 x 50 cm) ---
 TELA_LARGO_BASE_CM = 140
 TELA_ANCHO_BASE_CM = 50
 TELA_AREA_BASE_CM2 = TELA_LARGO_BASE_CM * TELA_ANCHO_BASE_CM  # 7000
-TELA_TIPO_BASE_PREFERIDO = "Rollo 140x50"  # fallback genérico si no encuentra 'asiento'/'respaldo'
+TELA_TIPO_BASE_PREFERIDO = "Rollo 140x50"
 
-# Ancho específico por modelo y tipo
 ANCHO_TELA_CM = {
     ("Silla Franca", "Tela asiento"): 46,
-    # Franca sin respaldo
-
     ("Silla Luna", "Tela asiento"): 46,
-    # Luna sin respaldo
-
     ("Silla Mora", "Tela asiento"): 46,
     ("Silla Mora", "Tela respaldo"): 23,
-
     ("Silla Xanaes", "Tela asiento"): 46,
     ("Silla Xanaes", "Tela respaldo"): 40,
-
     ("Silla Gala", "Tela asiento"): 55,
     ("Silla Gala", "Tela respaldo"): 69,
-
     ("Banquetas Umma", "Tela asiento"): 46,
     ("Banquetas Umma", "Tela respaldo"): 39,
-    # Silla Eva sin tela
 }
 
 def localizar_tipo_tela(df_stock, keywords, preferido=TELA_TIPO_BASE_PREFERIDO):
-    """
-    Busca en df_stock (Categoría=='Tela') un 'Tipo' que contenga alguna keyword
-    (ej. ['asiento'] o ['respaldo']). Si no encuentra, intenta 'Rollo 140x50'.
-    Devuelve el texto EXACTO del 'Tipo' en el CSV.
-    """
     tipos = df_stock[df_stock["Categoría"] == "Tela"]["Tipo"].astype(str)
     for t in tipos:
         s = t.lower().replace(" ", "")
@@ -102,12 +192,11 @@ def localizar_tipo_tela(df_stock, keywords, preferido=TELA_TIPO_BASE_PREFERIDO):
 def es_respaldo(tipo_str: str) -> bool:
     return "respaldo" in str(tipo_str).lower()
 
-# --- Cálculo de caños por barra de 6 m (helper) ---
 def calcular_barras_usadas(cortes):
     total_cm = sum(cortes)
     return math.ceil(total_cm / 600)
 
-# --- DESPIECE COMPLETO ACTUALIZADO ---
+# --- DESPIECE COMPLETO ---
 df_despiece = pd.DataFrame([
     # Silla Franca
     ["Silla Franca", "Caño", '1 1/2"', 42, 2],
@@ -206,12 +295,10 @@ df_despiece = pd.DataFrame([
     ["Perchero", "Caño", '1 1/4"', 130, 1],
 ], columns=["Modelo", "Categoría", "Tipo", "Largo (cm)", "Cantidad"])
 # =========================
-# PARTE 2 — UI + SIMULACIÓN + GUARDADO PERSISTENTE
+# PARTE 2 — UI + SIMULACIÓN + GUARDADO
 # =========================
 st.set_page_config(page_title="Sistema de Despiece", layout="wide")
 st.title("📐 Sistema de Despiece y Stock – DELARTE")
-
-st.caption(f"📁 Stock persistente: {ARCHIVO_STOCK}")
 
 menu = st.sidebar.radio("Menú", ["📐 Despiece", "📦 Stock"])
 
@@ -249,7 +336,7 @@ if menu == "📐 Despiece":
     tipo_tela_respaldo = localizar_tipo_tela(df_stock, keywords=["respaldo"])
 
     # Diccionario de stock
-    stock_dict = { (fila["Categoría"], fila["Tipo"]): fila["Stock"] for _, fila in df_stock.iterrows() }
+    stock_dict = {(fila["Categoría"], fila["Tipo"]): fila["Stock"] for _, fila in df_stock.iterrows()}
 
     # Ancho visible (numérico o NaN)
     def ancho_visible_row(row):
@@ -259,8 +346,7 @@ if menu == "📐 Despiece":
             return 39.0  # 25x39
         return np.nan
 
-    df_modelo["Ancho (cm)"] = df_modelo.apply(ancho_visible_row, axis=1)
-    df_modelo["Ancho (cm)"] = pd.to_numeric(df_modelo["Ancho (cm)"], errors="coerce")
+    df_modelo["Ancho (cm)"] = pd.to_numeric(df_modelo.apply(ancho_visible_row, axis=1), errors="coerce")
 
     # Stock actual por fila
     def obtener_stock_actual(row):
@@ -344,22 +430,22 @@ if menu == "📐 Despiece":
                 caños_usados = float(consumo) / 600.0
                 mask = (df_stock["Categoría"] == clave[0]) & (df_stock["Tipo"] == clave[1])
                 if mask.any():
-                    df_stock.loc[mask, "Stock"] -= caños_usados
+                    df_stock.loc[mask, "Stock"] = pd.to_numeric(df_stock.loc[mask, "Stock"], errors="coerce").fillna(0.0) - caños_usados
             else:
                 mask = (df_stock["Categoría"] == clave[0]) & (df_stock["Tipo"] == clave[1])
                 if mask.any():
-                    df_stock.loc[mask, "Stock"] -= float(consumo)
+                    df_stock.loc[mask, "Stock"] = pd.to_numeric(df_stock.loc[mask, "Stock"], errors="coerce").fillna(0.0) - float(consumo)
 
-        guardar_stock(df_stock)  # <-- queda guardado en stock_runtime.csv
-        st.success("✅ Producción guardada y stock actualizado (persistente).")
+        guardar_stock(df_stock)  # guarda en Sheets si hay, o en stock_runtime.csv
+        st.success("✅ Producción guardada y stock actualizado.")
 
 elif menu == "📦 Stock":
     st.subheader("📦 Stock de Materiales")
     df_stock = cargar_stock()
     edited_df = st.data_editor(df_stock, num_rows="dynamic", use_container_width=True)
     if st.button("💾 Guardar Cambios en Stock", key="guardar_stock"):
-        guardar_stock(edited_df)  # <-- queda guardado en stock_runtime.csv
-        st.success("✅ Cambios guardados correctamente (persistente).")
+        guardar_stock(edited_df)
+        st.success("✅ Cambios guardados correctamente.")
 # =========================
 # PARTE 3 — EXPORTACIÓN A EXCEL + DESCARGA
 # =========================
@@ -419,7 +505,7 @@ def exportar_excel(df, modelo, cantidad, cliente, color_tela, color_cano):
 
 # --- BOTÓN PARA IMPRIMIR DESPIECE ---
 try:
-    if menu == "📐 Despiece" and not df_modelo.empty:
+    if 'menu' in locals() and menu == "📐 Despiece" and 'df_modelo' in locals() and not df_modelo.empty:
         excel_bytes = exportar_excel(df_modelo, modelo_seleccionado, cantidad, cliente, color_tela, color_cano)
         st.download_button(
             label="🖨️ Imprimir Despiece",
@@ -428,5 +514,5 @@ try:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="descargar_excel"
         )
-except NameError:
+except Exception:
     pass
